@@ -5,7 +5,7 @@
 
 import { SingleBar, Presets } from "cli-progress";
 import { waitForStdin, waitForInput, waitForValidInput, bold, colored, getSeverity, createGuidStrings, expandGuidRegex, pluralForm } from "./utils";
-import { COMMENT_CHAR, SOFT_BLOCK, HARD_BLOCK, DECIMAL_FORMAT, HIGH_NUMBER_OF_USERS } from "./constants";
+import { COMMENT_CHAR, HARD_BLOCK, DECIMAL_FORMAT, HIGH_NUMBER_OF_USERS } from "./constants";
 import { ADDON_STATUS, DjangoUserModels, AddonAdminPage, getConfig, detectIdType } from "amolib";
 
 /**
@@ -69,20 +69,23 @@ export default class Mozblocklist {
       if (!guid || guid.startsWith(COMMENT_CHAR)) {
         continue;
       }
+
+      let regexmatches = [...regexes.keys()].filter(re => guid.match(re));
+
       if (guids.has(guid)) {
         let entry = guids.get(guid);
+        if (regexmatches.length) {
+          console.error(`Warning: ${guid} appears in a single and a regex block: ${regexmatches}`);
+        }
+        existing.set(guid, entry);
+      } else if (regexmatches.length) {
+        if (regexmatches.length > 1) {
+          console.error(`Warning: ${guid} appears in more than one regex block: ${regexmatches}`);
+        }
+        let entry = regexes.get(regexmatches[0]);
         existing.set(guid, entry);
       } else {
-        let regexmatches = [...regexes.keys()].filter(re => guid.match(re));
-        if (regexmatches.length) {
-          if (regexmatches.length > 1) {
-            // console.error(`Warning: ${guid} appears in more than one regex block: ${regexmatches}`);
-          }
-          let entry = regexes.get(regexmatches[0]);
-          existing.set(guid, entry);
-        } else {
-          newguids.add(guid);
-        }
+        newguids.add(guid);
       }
     }
 
@@ -95,13 +98,12 @@ export default class Mozblocklist {
    * @param {string} name                 The extension name.
    * @param {string} versions             The version range(s).
    * @param {string} reason               The reason to block.
-   * @param {number} severity             The blocklist severity constant.
    * @param {string[]} guids              An array of guids to block.
    * @param {?string} additionalInfo      Additional information for the bug.
    * @param {?string} platformVersions    The platform version range.
    * @return {string}                     The markdown description.
    */
-  compileDescription(name, versions, reason, severity, guids, additionalInfo=null, platformVersions="<all platforms>") {
+  compileDescription(name, versions, reason, guids, additionalInfo=null, platformVersions="<all platforms>") {
     /**
      * Removes backticks from the start of each line for use in a backticked string.
      *
@@ -142,7 +144,6 @@ export default class Mozblocklist {
       ["Extension name", name],
       ["Extension versions affected", versions],
       ["Platforms affected", platformVersions],
-      ["Block severity", getSeverity(severity)]
     ]);
 
     descr += "\n### Reason\n" + unlink(reason);
@@ -473,6 +474,25 @@ export default class Mozblocklist {
     console.log(output.join("\n"));
   }
 
+  async showUsage(guids) {
+    let usage = await this.redash_telemetry.queryUsage(guids);
+    let missing = guids.filter(guid => !(guid in usage));
+    if (missing.length) {
+      console.log(bold("Usage numbers for the following guids were not found:"));
+      console.log("\t" + missing.join("\n\t") + "\n");
+    }
+
+    let total = 0;
+
+    console.log(Object.entries(usage).map(([guid, users]) => {
+      let usercount = colored(users > HIGH_NUMBER_OF_USERS ? colored.RED : colored.RESET, DECIMAL_FORMAT.format(users));
+      total += users;
+      return `${guid} - ${usercount}`;
+    }).join("\n"));
+
+    console.log("\nTotal: " + colored(total > HIGH_NUMBER_OF_USERS ? colored.RED : colored.RESET, DECIMAL_FORMAT.format(total)));
+  }
+
   /**
    * Display pending blocks.
    *
@@ -555,7 +575,7 @@ export default class Mozblocklist {
           if (this.globalOpts.debug) {
             // This can be a lot of information, only show this on debug
             for (let guid of regexToGuids[entry.guid]) {
-              console.log(`\t\t${guid} - ${DECIMAL_FORMAT.format(usage[guid])}`);
+              console.log(`\t\t${guid} - ${DECIMAL_FORMAT.format(usage[guid] || 0)}`);
             }
           }
         }
@@ -615,13 +635,23 @@ export default class Mozblocklist {
       data = await waitForStdin();
     }
 
+    data = data.map(id => id.trim());
+
     let type = detectIdType(data);
     switch (type) {
       case "id":
       case "slug": {
         console.warn(`Converting ${type}s to guids`);
         let result = await this.redash.queryMapIds(type, "guid", data);
-        data = [...Object.values(result)];
+        let found = new Set(Object.keys(result));
+        let missing = data.filter(key => !found.has(key));
+        if (missing.length) {
+          console.warn(bold(`Could not find the following ${type}s:`));
+          console.warn(missing.join("\n"));
+          console.log("");
+        }
+
+        data = Object.values(result);
         break;
       }
       case "mixed":
@@ -643,24 +673,6 @@ export default class Mozblocklist {
     }
 
     let { existing, newguids } = this.readGuidData(data, blockguids, blockregexes);
-    let newguidvalues = [...newguids.values()];
-
-    if (newguidvalues && newguidvalues.length > 0) {
-      // Show legacy add-ons
-      let [wx, legacy, invalid] = await this.redash.querySeprateLegacyAndWX(newguidvalues);
-      newguidvalues = wx;
-      if (legacy.length) {
-        console.log(bold("The following guids are for legacy add-ons and will not be blocked:"));
-        console.log(legacy.join("\n"));
-      }
-
-      if (invalid.length) {
-        console.log(bold("Warning: the following guids are not in the database:"));
-        console.log(invalid.join("\n"));
-      }
-    }
-
-    console.log("");
 
     // Show existing guids for information
     if (existing.size) {
@@ -677,6 +689,30 @@ export default class Mozblocklist {
       console.log([...otherguidset].join("\n"));
       console.log("");
     }
+
+    let newguidvalues = [...newguids.values()];
+    if (newguidvalues && newguidvalues.length > 0) {
+      // Show legacy add-ons, add-ons without any signed files, and unknown/invalid guids
+      let [webex, legacy, unsigned, invalid] = await this.redash.querySeparateLegacyAndUnsigned(newguidvalues);
+      newguidvalues = webex;
+
+      if (unsigned.length) {
+        console.log(bold("The following guids do not have any signed files:"));
+        console.log(unsigned.join("\n"));
+      }
+
+      if (legacy.length) {
+        console.log(bold("The following guids are for legacy add-ons and will not be blocked:"));
+        console.log(legacy.join("\n"));
+      }
+
+      if (invalid.length) {
+        console.log(bold("Warning: the following guids are not in the database:"));
+        console.log(invalid.join("\n"));
+      }
+    }
+
+    console.log("");
 
     // Show a list of new guids that can be blocked
     if (newguidvalues.length > 0) {
@@ -814,20 +850,6 @@ export default class Mozblocklist {
       additionalInfo = await waitForInput("Any additional info for the bug?", false);
     }
 
-    let severity;
-    while (true) {
-      severity = await waitForInput("Severity [HARD/soft]:");
-      if (severity == "hard" || severity == "") {
-        severity = HARD_BLOCK;
-        break;
-      } else if (severity == "soft") {
-        severity = SOFT_BLOCK;
-        break;
-      }
-
-      console.log("Invalid severity, must be hard or soft");
-    }
-
     let minVersion = "0";
     let maxVersion = "*";
 
@@ -837,7 +859,6 @@ export default class Mozblocklist {
       maxVersion = await waitForInput("Maximum version [*]:") || "*";
     }
 
-    let shouldBan = await waitForInput("Ban involved users? [yN]");
     let answer = await waitForValidInput("Ready to create the blocklist entry?", "yn");
 
     if (answer == "y") {
@@ -851,7 +872,8 @@ export default class Mozblocklist {
         });
       } else {
         let versions = minVersion == "0" && maxVersion == "*" ? "<all versions>" : `${minVersion} - ${maxVersion}`;
-        let description = this.compileDescription(name, versions, reason.bugzilla, severity, guids, additionalInfo);
+        let description = this.compileDescription(name, versions, reason.bugzilla, guids, additionalInfo);
+
 
         if (this.bugzilla.readonly) {
           throw new Error("Bugzilla is set to read-only, cannot create bug");
@@ -880,7 +902,7 @@ export default class Mozblocklist {
       }
 
       for (let guidstring of blocks) {
-        let entry = await this.kinto.createBlocklistEntry(guidstring, bugid, name, reason.kinto, severity, minVersion, maxVersion);
+        let entry = await this.kinto.createBlocklistEntry(guidstring, bugid, name, reason.kinto, HARD_BLOCK, minVersion, maxVersion);
         console.log(`${logblockprefix}${this.kinto.remote_writer}/admin/#/buckets/staging/collections/addons/records/${entry.data.id}/attributes`);
       }
 
@@ -888,12 +910,12 @@ export default class Mozblocklist {
         await this.signBlocklist({ selfsign, selfreview: true });
       }
 
-      if (shouldBan == "y") {
-        let users = await this.redash.queryUsersForIds("guid", guids);
-        console.log("Banning these users:");
-        console.log(users.map(user => `\t${user.user_id} (${user.username} - ${user.display_name})`).join("\n"));
-        await waitForInput("Really go ahead? [yN]");
+      let users = await this.redash.queryUsersForIds("guid", guids);
+      console.log("The following users are involved with these add-ons:");
+      console.log(users.map(user => `\t${user.user_id} (${user.username} - ${user.display_name})`).join("\n"));
+      let shouldBan = await waitForInput("Should they be banned? [yN]");
 
+      if (shouldBan == "y") {
         let usermodels = new DjangoUserModels(this.amo);
         await usermodels.ban(users.map(user => user.user_id));
       } else {
